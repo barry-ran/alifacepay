@@ -1,0 +1,2 @@
+pycryptodome>=3.8.2
+alipay-sdk-python>=3.3.92

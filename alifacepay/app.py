@@ -34,21 +34,26 @@ from alipay.aop.api.domain.AlipayTradeRefundModel import AlipayTradeRefundModel
 from alipay.aop.api.request.AlipayTradeRefundRequest import AlipayTradeRefundRequest
 from alipay.aop.api.response.AlipayTradeRefundResponse import AlipayTradeRefundResponse
 
+from alipay.aop.api.util.SignatureUtils import verify_with_rsa
+
 logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(levelname)s %(message)s',
         filemode='a', )
 
 '''
-1. 通过预下单接口生成的二维码有效时间为2小时
-2. 可退款期限根据签约协议确定，一般为三个月或十二个月
-3. 对于未支付的订单，请及时通过调用撤销接口关闭订单（注意：超过24小时的订单无法撤销）；
-另外一种方法是为每笔订单设置超时时间，超过时间未支付的订单会自动关闭。
+1. 默认通过预下单接口生成的二维码有效时间为2小时，这里设置为5分钟 qr_code_timeout_express
+2. 默认用户扫码后支付超时时间为15天，这里设置为5分钟 timeout_express
+3. 可退款期限根据签约协议确定，一般为三个月或十二个月
+4. 对于未支付的订单，请及时通过调用撤销接口关闭订单（注意：超过24小时的订单无法撤销）；
+另外一种方法是为每笔订单设置超时时间，超过时间未支付的订单会自动关闭（当前采用这种方案，5分钟超时）。
 '''
+
+
 class AliFacePay:
     logger = logging.getLogger('')
 
-    def __init__(self, app_id, app_private_key, alipay_public_key, sandbox_debug=False):
+    def __init__(self, app_id, app_private_key, alipay_public_key, notify_url=None, sandbox_debug=False):
         '''
         设置配置，包括支付宝网关地址、app_id、应用私钥、支付宝公钥等，其他配置值可以查看AlipayClientConfig的定义。
         '''
@@ -63,6 +68,8 @@ class AliFacePay:
         logger参数用于打印日志，不传则不打印，建议传递。
         '''
         self.client = DefaultAlipayClient(alipay_client_config=alipay_client_config, logger=AliFacePay.logger)
+        self.notify_url = notify_url
+        self.alipay_public_key = alipay_public_key
 
     '''
     功能：生成支付二维码，生成二维码后，展示给用户，由用户扫描二维码创建支付订单
@@ -84,8 +91,16 @@ class AliFacePay:
         precreate_model.out_trade_no = out_trade_no
         precreate_model.total_amount = total_amount
         precreate_model.subject = subject
+
         # 该笔订单允许的最晚付款时间，逾期将自动关闭交易(TRADE_CLOSED),时间从用户扫描付款二维码以后开始计算
-        precreate_model.timeout_express = '2m'
+        # 扫码后的最晚付款时间限制 默认交易超时时间为15天
+        precreate_model.timeout_express = '5m'
+
+        # 二维码有效期，从创建二维码开始直到用户扫码，默认2h，要求最小2m
+        # （沙箱目前qr_code_timeout_express这个参数是不生效的，实际环境才有效果）
+        # 到期二维码失效，不会影响订单状态，因为此时订单还没有创建
+        # 二维码创建后的最晚扫码时间限制
+        precreate_model.qr_code_timeout_express = '5m'
 
         # 花呗，默认支持吗？
         #precreate_model.enable_pay_channels = 'pcredit'
@@ -96,6 +111,7 @@ class AliFacePay:
             precreate_model.body = body
 
         precreate_request = AlipayTradePrecreateRequest(biz_model=precreate_model)
+        precreate_request.notify_url = self.notify_url
         precreate_response_content = None
         qr_code = None
         try:
@@ -130,6 +146,7 @@ class AliFacePay:
     out_trade_no：订单号
     buyer_logon_id：买家支付宝账号
     trade_status：交易状态：WAIT_BUYER_PAY（交易创建，等待买家付款）、TRADE_CLOSED（未付款交易超时关闭，或支付完成后全额退款）、TRADE_SUCCESS（交易支付成功）、TRADE_FINISHED（交易结束，不可退款）
+    交易状态 TRADE_FINISHED 的通知触发条件是商户签约的产品不支持退款功能的前提下，买家付款成功；或者，商户签约的产品支持退款功能的前提下，交易已经成功并且已经超过可退款期限
     total_amount：交易金额
     '''
     def query(self, out_trade_no):
@@ -290,6 +307,28 @@ class AliFacePay:
                       + refund_response.sub_msg)
         return ret
 
+    '''
+    功能：验证异步回调签名
+
+    参数：
+    params：回调通知参数字典，例如flask通知中使用request.form.to_dict()来构造参数（params = request.form.to_dict()）
+
+    返回值：bool 是否验证成功
+    '''
+
+    def verify_params_sign(self, params):
+        # 文档 https://docs.open.alipay.com/194/103296#s5
+        sign = params.pop('sign', None)  # 取出sign参数
+        params.pop('sign_type')  # 取出sign_type参数
+        params = sorted(params.items(), key=lambda e: e[0], reverse=False)  # 取出字典元素按key的字母升序排序形成列表
+        message = "&".join(u"{}={}".format(k, v) for k, v in params).encode()  # 将列表转为二进制参数字符串
+        try:
+            status = verify_with_rsa(self.alipay_public_key.encode('utf-8').decode('utf-8'), message,
+                                     sign)  # 验证签名并获取结果
+            return status  # 返回验证结果
+        except Exception as e:  # 如果验证失败，返回假值。
+            return False
+
     @classmethod
     def get_rand_string(cls, length=10):
         # 生成len长度的随机字符串
@@ -307,23 +346,27 @@ class AliFacePay:
         return trade_no
 
 
+'''
+同步方式使用当面付接口
+'''
+
 if __name__ == "__main__":
     # 基础信息配置
     # 只需要三个关键信息 app_id，alipay_public_key，app_private_key
     sandbox = True
     if sandbox:
         app_id = '2016092900626816'
-        alipay_public_key_string = open("../alipay_public_key_sandbox.txt").read()
+        alipay_public_key_string = open("G:/python/alipay_key/alipay_public_key_sandbox.txt").read()
     else:
         app_id = '2019061665605123'
-        alipay_public_key_string = open("../alipay_public_key.txt").read()
+        alipay_public_key_string = open("G:/python/alipay_key/alipay_public_key.txt").read()
 
-    app_private_key_string = open("../app_private_key.pem").read()
+    app_private_key_string = open("G:/python/alipay_key/app_private_key.pem").read()
 
-    pay = AliFacePay(app_id, app_private_key_string, alipay_public_key_string, sandbox)
+    pay = AliFacePay(app_id, app_private_key_string, alipay_public_key_string, None, sandbox)
 
-    out_trade_no = 'out_trade_no20190616_13'
-    #out_trade_no = AliFacePay.gen_trade_no('yqhs')
+    #out_trade_no = 'out_trade_no20190616_13'
+    out_trade_no = AliFacePay.gen_trade_no('yqhs')
 
     # print(pay.cancel(out_trade_no))
     # print(pay.close(out_trade_no))
@@ -366,3 +409,72 @@ if __name__ == "__main__":
 
     else:
         print('付款二维码生成失败')
+
+
+'''
+异步方式使用当面付接口（以flask为例）
+'''
+
+'''
+from flask import Flask
+from flask import render_template, request, Response
+from alifacepay import AliFacePay
+
+app = Flask(__name__)
+
+# 基础信息配置
+# 只需要三个关键信息 app_id，alipay_public_key，app_private_key
+sandbox = True
+if sandbox:
+    app_id = '2016092900626816'
+    alipay_public_key_string = open("G:/python/alipay_key/alipay_public_key_sandbox.txt").read()
+else:
+    app_id = '2019061665605123'
+    alipay_public_key_string = open("G:/python/alipay_key/alipay_public_key.txt").read()
+
+app_private_key_string = open("G:/python/alipay_key/app_private_key.pem").read()
+
+ali_face_pay = AliFacePay(app_id, app_private_key_string, alipay_public_key_string,
+                 'http://pzcuni.natappfree.cc/alipay_nofity', sandbox)
+
+
+@app.route('/')
+def hello_world():
+    out_trade_no = AliFacePay.gen_trade_no('yqhs')
+    # 生成付款二维码，可以去这里生成qr_code的二维码图片 http://www.liantu.com/
+    qr_code = ali_face_pay.precreate(out_trade_no, 1, "测试")
+    return Response(qr_code)
+
+
+@app.route('/alipay_nofity', methods=['POST'])
+def alipay_nofity():
+    data = request.form.to_dict()
+    print(data)
+    if ali_face_pay.verify_params_sign(data):
+        # 通知参数说明 https://docs.open.alipay.com/194/103296#s5
+        notify_time = data['notify_time']           # 通知发出的时间
+        notify_type = data['notify_type']           # 通知类型
+        trade_status = data['trade_status']         # 订单状态
+        out_trade_no = data['out_trade_no']         # 订单号
+        buyer_logon_id = data['buyer_logon_id']     # 买家支付宝账号
+        total_amount = data['total_amount']         # 订单金额
+        subject = data['subject']                   # 订单标题
+
+        # 异步通知默认只会收到TRADE_SUCCESS或者TRADE_FINISHED
+        # 沙盒下测试居然收到了WAIT_BUYER_PAY，不过实际环境收不到
+        if notify_type == 'trade_status_sync':
+            print(trade_status)
+            pay_success = False
+            if trade_status == 'TRADE_SUCCESS' or trade_status == 'TRADE_FINISHED':
+                pay_success = True
+
+        return Response('success')
+
+    print('验证签名失败')
+    return '404'
+
+
+if __name__ == '__main__':
+    app.run()
+
+'''

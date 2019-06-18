@@ -1,7 +1,7 @@
 # alifacepay
 支付宝当面付sdk封装
 
-[支付宝当面付](https://blog.csdn.net/rankun1/article/details/92401295)支持个人申请，无需企业认证
+[支付宝当面付](https://blog.csdn.net/rankun1/article/details/92401295)支持个人申请，无需企业认证，可以参见[我的博客](https://blog.csdn.net/rankun1/article/details/92401295)有详细教程。
 
 # 描述
 基于[蚂蚁金服开放平台 Python SDK](https://github.com/alipay/alipay-sdk-python-all)封装了当面付（扫码支付）常用操作，使用非常简单，在支付宝开发平台配置好应用的公钥后（[配置流程](https://blog.csdn.net/rankun1/article/details/92401295)），配置三个参数即可体验支付流程。当然，别忘了安装requirements.txt里的依赖包。
